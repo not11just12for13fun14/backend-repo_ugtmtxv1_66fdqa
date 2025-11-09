@@ -36,12 +36,18 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
-async def get_user_by_email(email: str) -> Optional[dict]:
-    return await db["user"].find_one({"email": email})
+async def get_user_by_identifier(identifier: str) -> Optional[dict]:
+    # Try by email first
+    user = await db["user"].find_one({"email": identifier})
+    if user:
+        return user
+    # Fallback: allow login by full_name as a username-like field
+    user = await db["user"].find_one({"full_name": identifier})
+    return user
 
 
-async def authenticate_user(email: str, password: str) -> Optional[dict]:
-    user = await get_user_by_email(email)
+async def authenticate_user(identifier: str, password: str) -> Optional[dict]:
+    user = await get_user_by_identifier(identifier)
     if not user or not verify_password(password, user.get("hashed_password", "")):
         return None
     user["id"] = str(user.pop("_id"))
@@ -97,10 +103,30 @@ async def test():
         raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
 
 
+async def ensure_default_admin():
+    """Create a default admin if none exists. Safe to call at auth time."""
+    try:
+        existed = await db["user"].find_one({"role": "admin"})
+        if existed:
+            return
+        # Create default admin based on user's request
+        hashed = get_password_hash("Antonio89")
+        user_doc = User(
+            email="antonio.admin@demo.local",
+            full_name="AntonioAdmin",
+            hashed_password=hashed,
+            role="admin",
+        ).model_dump()
+        await create_document("user", user_doc)
+    except Exception:
+        # Silently ignore to avoid breaking auth if DB is down
+        return
+
+
 # Auth routes
 @app.post("/auth/register", response_model=UserPublic)
 async def register(user_in: UserCreate):
-    existing = await get_user_by_email(user_in.email)
+    existing = await db["user"].find_one({"email": user_in.email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed = get_password_hash(user_in.password)
@@ -122,9 +148,11 @@ async def register(user_in: UserCreate):
 
 @app.post("/auth/token", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # Ensure a default admin exists for first run
+    await ensure_default_admin()
     user = await authenticate_user(form_data.username, form_data.password)
     if not user:
-        raise HTTPException(status_code=400, detail="Incorrect email or password")
+        raise HTTPException(status_code=400, detail="Incorrect credentials")
     access_token = create_access_token({"sub": user["id"], "role": user.get("role", "student")})
     return {"access_token": access_token, "token_type": "bearer"}
 
