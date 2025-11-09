@@ -1,55 +1,49 @@
-"""
-Database Helper Functions
-
-MongoDB helper functions ready to use in your backend code.
-Import and use these functions in your API endpoints for database operations.
-"""
-
-from pymongo import MongoClient
-from datetime import datetime, timezone
 import os
-from dotenv import load_dotenv
-from typing import Union
-from pydantic import BaseModel
+from typing import Any, Dict, List, Optional
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
-# Load environment variables from .env file
-load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "app_db")
 
-_client = None
-db = None
+_client: Optional[AsyncIOMotorClient] = None
+_db: Optional[AsyncIOMotorDatabase] = None
 
-database_url = os.getenv("DATABASE_URL")
-database_name = os.getenv("DATABASE_NAME")
 
-if database_url and database_name:
-    _client = MongoClient(database_url)
-    db = _client[database_name]
+def get_db() -> AsyncIOMotorDatabase:
+    global _client, _db
+    if _db is None:
+        _client = AsyncIOMotorClient(DATABASE_URL)
+        _db = _client[DATABASE_NAME]
+    return _db
 
-# Helper functions for common database operations
-def create_document(collection_name: str, data: Union[BaseModel, dict]):
-    """Insert a single document with timestamp"""
-    if db is None:
-        raise Exception("Database not available. Check DATABASE_URL and DATABASE_NAME environment variables.")
+# Backwards-compatible export used by the scaffolding
+db = get_db()
 
-    # Convert Pydantic model to dict if needed
-    if isinstance(data, BaseModel):
-        data_dict = data.model_dump()
-    else:
-        data_dict = data.copy()
 
-    data_dict['created_at'] = datetime.now(timezone.utc)
-    data_dict['updated_at'] = datetime.now(timezone.utc)
+async def ensure_indexes() -> None:
+    # Unique email for users
+    await db["user"].create_index("email", unique=True)
+    # Basic indexes for courses
+    await db["course"].create_index([("published", 1)])
+    await db["course"].create_index([("title", 1)])
 
-    result = db[collection_name].insert_one(data_dict)
-    return str(result.inserted_id)
 
-def get_documents(collection_name: str, filter_dict: dict = None, limit: int = None):
-    """Get documents from collection"""
-    if db is None:
-        raise Exception("Database not available. Check DATABASE_URL and DATABASE_NAME environment variables.")
-    
-    cursor = db[collection_name].find(filter_dict or {})
-    if limit:
-        cursor = cursor.limit(limit)
-    
-    return list(cursor)
+async def create_document(collection_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    now = datetime.utcnow().isoformat()
+    data_to_insert = {**data, "created_at": now, "updated_at": now}
+    result = await db[collection_name].insert_one(data_to_insert)
+    inserted = await db[collection_name].find_one({"_id": result.inserted_id})
+    if inserted:
+        inserted["id"] = str(inserted.pop("_id"))
+    return inserted or {}
+
+
+async def get_documents(collection_name: str, filter_dict: Optional[Dict[str, Any]] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    filter_dict = filter_dict or {}
+    cursor = db[collection_name].find(filter_dict).limit(limit)
+    docs: List[Dict[str, Any]] = []
+    async for doc in cursor:
+        doc["id"] = str(doc.pop("_id"))
+        docs.append(doc)
+    return docs
